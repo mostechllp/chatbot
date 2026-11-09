@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const { sendWelcomeMessage, sendProductsMessage, sendProductDetailsMessage, sendProductMedia, sendProductVideoLink, sendTextMessage, sendProductListMessage } = require("../services/whatsapp");
+const { sendWelcomeMessage, sendProductsMessage, sendProductDetailsMessage, sendProductMedia, sendProductVideoLink, sendTextMessage, sendProductListMessage, sendCatalogueListMessage, sendMoreOptionsMessage, sendCBMCalculationMessage, sendCBMResultMessage, findUserManualUrl } = require("../services/whatsapp");
 const db = require("../config/db");
 const { sendRetailCategories } = require("../services/products/retail/retail");
 const { sendWholesaleCategories } = require("../services/products/wholsale/wholsale");
@@ -651,25 +651,69 @@ router.post("/", async (req, res) => {
             }
             if (userStates[from]?.step === "WAITING_FOR_CORRECTED_INSTALL_LOCATION") { userStates[from].location = text; userStates[from].step = "WAITING_FOR_INSTALL_SUBMIT"; await sendInstallSummaryMessage(from, userStates[from], true); return res.sendStatus(200); }
 
-            if (text.startsWith('dl_doc_') || text.startsWith('dl_img_') || text.startsWith('dl_vid_')) {
-                const action = text.split('_')[1]; // 'doc', 'img', or 'vid'
+            if (text.startsWith('more_imgs_') || text.startsWith('dl_doc_') || text.startsWith('dl_img_') || text.startsWith('dl_mimg_') || text.startsWith('dl_vid_') || text.startsWith('dl_pvid_') || text.startsWith('dl_umanual_')) {
+                const action = text.split('_')[1]; // 'imgs', 'doc', 'img', 'mimg', 'vid', 'pvid', or 'umanual'
                 const productId = text.split('_')[2];
                 
                 try {
-                    const [productRows] = await db.query('SELECT * FROM products WHERE id = ?', [productId]);
+                    const [productRows] = await db.query(`
+                        SELECT id, name AS sku, title AS name, main_image AS image_url, drawing_image AS drawing_image_url, datasheet AS data_sheet_url, video_url AS installation_video_url, product_video_url AS youtube_url 
+                        FROM catalog_product 
+                        WHERE id = ?`, 
+                        [productId]
+                    );
                     if (productRows.length > 0) {
                         const product = productRows[0];
                         if (action === 'doc' && product.data_sheet_url) {
                             await sendProductMedia(from, product.data_sheet_url, 'document', `${product.sku || 'Product'}-DataSheet.pdf`);
-                        } else if (action === 'img' && product.image_url) {
-                            // Send image as a document to bypass WhatsApp's strict image format validation (like unsupported WebP)
-                            // We add a generic extension or let WhatsApp infer it from the mime type.
-                            await sendProductMedia(from, product.image_url, 'document', `${product.sku || 'Product'}-Image`);
+                        } else if (action === 'mimg' && product.image_url) {
+                            await sendProductMedia(from, product.image_url, 'image', null);
+                        } else if (action === 'img' && product.drawing_image_url) {
+                            await sendProductMedia(from, product.drawing_image_url, 'document', `${product.sku || 'Product'}-Drawing`);
                         } else if (action === 'vid') {
+                            if (product.installation_video_url) {
+                                await sendProductVideoLink(from, product.installation_video_url);
+                            } else {
+                                await sendTextMessage(from, "This product has no installation video available at this moment.");
+                            }
+                        } else if (action === 'pvid') {
                             if (product.youtube_url) {
                                 await sendProductVideoLink(from, product.youtube_url);
                             } else {
-                                await sendTextMessage(from, "This product has no preview video available at this moment. Sorry for the inconvenience.");
+                                await sendTextMessage(from, "This product has no preview video available at this moment.");
+                            }
+                        } else if (action === 'imgs') {
+                            const [imageRows] = await db.query(`
+                                SELECT image 
+                                FROM catalog_productimage 
+                                WHERE product_id = ? 
+                                ORDER BY \`order\` ASC 
+                                LIMIT 5
+                            `, [productId]);
+                            
+                            if (imageRows.length > 0) {
+                                for (const imgRow of imageRows) {
+                                    if (imgRow.image) {
+                                        await sendProductMedia(from, imgRow.image, 'image', null);
+                                    }
+                                }
+                            } else {
+                                await sendTextMessage(from, "No additional images found for this product.");
+                            }
+                        } else if (action === 'umanual') {
+                            const sku = product.sku;
+                            if (sku) {
+                                const foundUrl = await findUserManualUrl(sku);
+
+                                if (foundUrl) {
+                                    const mediaType = foundUrl.endsWith('.pdf') ? 'document' : 'image';
+                                    const filename = foundUrl.endsWith('.pdf') ? `${sku}-UserManual.pdf` : null;
+                                    await sendProductMedia(from, foundUrl, mediaType, filename);
+                                } else {
+                                    await sendTextMessage(from, "Sorry, this product has no user manual.");
+                                }
+                            } else {
+                                await sendTextMessage(from, "Sorry, this product has no user manual.");
                             }
                         }
                     }
@@ -679,31 +723,240 @@ router.post("/", async (req, res) => {
                 return res.sendStatus(200);
             }
 
-            // Normalize user text: remove all spaces, hyphens, and convert to lowercase
-            const cleanText = text.replace(/[\s-]/g, '').toLowerCase();
+            if (text.startsWith('more_opts_')) {
+                const productId = text.split('_')[2];
+                try {
+                    const [productRows] = await db.query(`
+                        SELECT id, name AS sku, title AS name, main_image AS image_url, drawing_image AS drawing_image_url, datasheet AS data_sheet_url, video_url AS installation_video_url, product_video_url AS youtube_url, carton_length_cm, carton_width_cm, carton_height_cm 
+                        FROM catalog_product 
+                        WHERE id = ?`, 
+                        [productId]
+                    );
+                    if (productRows.length > 0) {
+                        await sendMoreOptionsMessage(from, productRows[0]);
+                    }
+                } catch (err) {
+                    console.error("Error sending more options:", err);
+                }
+                return res.sendStatus(200);
+            }
+
+            if (text.startsWith('cbm_calc_')) {
+                const productId = text.split('_')[2];
+                try {
+                    const [productRows] = await db.query(`
+                        SELECT id, name AS sku, title AS name, units_per_carton, carton_length_cm, carton_width_cm, carton_height_cm, gross_weight_per_carton_kg, net_weight_per_carton_kg
+                        FROM catalog_product 
+                        WHERE id = ?`, 
+                        [productId]
+                    );
+                    if (productRows.length > 0) {
+                        await sendCBMCalculationMessage(from, productRows[0]);
+                    }
+                } catch (err) {
+                    console.error("Error sending CBM calculation message:", err);
+                }
+                return res.sendStatus(200);
+            }
+
+            if (text.startsWith('cbm_start_')) {
+                const productId = text.split('_')[2];
+                userStates[from] = { step: "WAITING_FOR_CBM_CARTONS", productId: productId };
+                await sendTextMessage(from, "Please enter the number of required cartons:");
+                return res.sendStatus(200);
+            }
+
+            if (userStates[from]?.step === "WAITING_FOR_CBM_CARTONS") {
+                const numCartons = parseInt(text);
+                if (isNaN(numCartons) || numCartons <= 0) {
+                    await sendTextMessage(from, "Please enter a valid positive number for cartons.");
+                    return res.sendStatus(200);
+                }
+                
+                try {
+                    const productId = userStates[from].productId;
+                    const [productRows] = await db.query(`
+                        SELECT id, name AS sku, title AS name, units_per_carton, carton_length_cm, carton_width_cm, carton_height_cm, gross_weight_per_carton_kg, net_weight_per_carton_kg
+                        FROM catalog_product 
+                        WHERE id = ?`, 
+                        [productId]
+                    );
+                    if (productRows.length > 0) {
+                        const p = productRows[0];
+                        const cbmPerCarton = ((p.carton_length_cm || 0) * (p.carton_width_cm || 0) * (p.carton_height_cm || 0)) / 1000000;
+                        const totalCbm = (cbmPerCarton * numCartons).toFixed(4);
+                        const totalGross = ((p.gross_weight_per_carton_kg || 0) * numCartons).toFixed(2);
+                        const totalNet = ((p.net_weight_per_carton_kg || 0) * numCartons).toFixed(2);
+                        
+                        let resultText = `*Calculation Result*\n\n`;
+                        resultText += `Product Name: ${p.sku}\n`;
+                        resultText += `Product Title: ${p.name}\n`;
+                        resultText += `Gross Weight in Kg: ${totalGross} kg\n`;
+                        resultText += `Net Weight in Kg: ${totalNet} kg\n`;
+                        resultText += `Total Carton in Nos.: ${numCartons}\n`;
+                        resultText += `Total CBM: ${totalCbm}`;
+                        
+                        const encodedText = encodeURIComponent(resultText);
+                        const shareLink = `https://wa.me/?text=${encodedText}`;
+                        
+                        await sendCBMResultMessage(from, resultText, shareLink);
+                        delete userStates[from];
+                    }
+                } catch (err) {
+                    console.error("Error calculating CBM:", err);
+                    await sendTextMessage(from, "An error occurred while calculating CBM.");
+                }
+                return res.sendStatus(200);
+            }
+            // Normalize user text: remove all spaces, hyphens, dots, and invisible chars
+            const cleanText = text.replace(/[\s-\.\r\n\t]/g, '').toLowerCase();
+
+            const greetings = ["hi", "hello", "hey", "start", "menu", "help"];
+            if (greetings.includes(cleanText)) {
+                await sendWelcomeMessage(from);
+                return res.sendStatus(200);
+            }
+
+            if (text === "btn_products") {
+                const [catalogues] = await db.query(`
+                    SELECT id, title
+                    FROM catalog_catalogue
+                    WHERE active = 1
+                `);
+                
+                const orderList = [
+                    'Fixed Wall Mount Catalogue',
+                    'Tilt Wall Mount Catalogue',
+                    'Swivel Wall Mount - Single Arm Catalogue',
+                    'Swivel Wall Mount - Double Arm Catalogue',
+                    'TV Cart',
+                    'Gas Spring Desktop Mount Catalogue',
+                    'Projector Mounts Catalogue',
+                    'Tablet Mount Catalogue',
+                    'DVD / Receiver Mounts Catalogue'
+                ];
+                
+                catalogues.sort((a, b) => {
+                    let indexA = orderList.indexOf(a.title);
+                    let indexB = orderList.indexOf(b.title);
+                    if (indexA === -1) indexA = 999;
+                    if (indexB === -1) indexB = 999;
+                    return indexA - indexB;
+                });
+
+                if (catalogues.length > 0) {
+                    await sendCatalogueListMessage(from, catalogues, "Here are some product codes and names, please use that.");
+                }
+                return res.sendStatus(200);
+            }
+
+            if (text === "btn_install") {
+                await sendInstallationMessage(from);
+                return res.sendStatus(200);
+            }
+
+            if (text === "btn_support") {
+                await sendSupportMessage(from);
+                return res.sendStatus(200);
+            }
+
+            // Check if text is a catalogue selection
+            if (text.startsWith('cat_')) {
+                const catalogueId = text.split('_')[1];
+                const [catRows] = await db.query(`SELECT \`file\` FROM catalog_catalogue WHERE id = ?`, [catalogueId]);
+                if (catRows.length > 0 && catRows[0].file) {
+                    // Send the PDF from media path
+                    await sendProductMedia(from, catRows[0].file, 'document', `Catalogue.pdf`);
+                }
+                return res.sendStatus(200);
+            }
 
             // Check if text is a SKU in the database (Fuzzy search)
-            // We also strip spaces and hyphens from the DB sku for a robust comparison.
-            const query = `
-                SELECT p.*, c.mainCategory, c.subCategory 
-                FROM products p
-                LEFT JOIN categories c ON p.category_id = c.id
-                WHERE LOWER(REPLACE(REPLACE(p.sku, ' ', ''), '-', '')) = ?
-                   OR LOWER(REPLACE(REPLACE(p.sku, ' ', ''), '-', '')) LIKE ?
-            `;
-            const [rows] = await db.query(query, [cleanText, `%${cleanText}%`]);
+            let rows = [];
+            if (text.startsWith('prod_')) {
+                const parts = text.split('_');
+                const productId = parts[1];
+                const query = `
+                    SELECT 
+                        p.id, p.name AS sku, p.title AS name, p.main_image AS image_url, p.drawing_image AS drawing_image_url, p.datasheet AS data_sheet_url, p.video_url AS installation_video_url, p.product_video_url AS youtube_url, p.tags, p.units_per_carton, p.carton_length_cm, p.carton_width_cm, p.carton_height_cm, p.gross_weight_per_carton_kg, p.net_weight_per_carton_kg, p.slug AS productSlug, p.slug_path AS slug_path,
+                        c.name AS subCategory, c.slug AS subCategorySlug,
+                        mc.name AS mainCategory, mc.slug AS mainCategorySlug
+                    FROM catalog_product p
+                    LEFT JOIN catalog_category c ON p.subcategory_id = c.id
+                    LEFT JOIN catalog_maincategory mc ON c.main_category_id = mc.id
+                    WHERE p.id = ?
+                `;
+                [rows] = await db.query(query, [productId]);
+            } else {
+                const query = `
+                    SELECT 
+                        p.id, p.name AS sku, p.title AS name, p.main_image AS image_url, p.drawing_image AS drawing_image_url, p.datasheet AS data_sheet_url, p.video_url AS installation_video_url, p.product_video_url AS youtube_url, p.tags, p.units_per_carton, p.carton_length_cm, p.carton_width_cm, p.carton_height_cm, p.gross_weight_per_carton_kg, p.net_weight_per_carton_kg, p.slug AS productSlug, p.slug_path AS slug_path,
+                        c.name AS subCategory, c.slug AS subCategorySlug,
+                        mc.name AS mainCategory, mc.slug AS mainCategorySlug
+                    FROM catalog_product p
+                    LEFT JOIN catalog_category c ON p.subcategory_id = c.id
+                    LEFT JOIN catalog_maincategory mc ON c.main_category_id = mc.id
+                    WHERE LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.name, ' ', ''), '-', ''), '.', ''), '\r', ''), '\n', ''), '\t', '')) = ?
+                    ORDER BY p.created_at DESC LIMIT 1
+                `;
+                [rows] = await db.query(query, [cleanText]);
+            }
             
             if (rows.length > 0) {
                 // Found a product matching this SKU! Send the first match.
-                await sendProductDetailsMessage(from, rows[0]);
+                let product = rows[0];
+                
+                try {
+                    const specQuery = `SELECT \`key\`, \`value\` FROM catalog_productspecification WHERE product_id = ?`;
+                    const [specs] = await db.query(specQuery, [product.id]);
+                    
+                    specs.forEach(spec => {
+                        const keyStr = (spec.key || '').toLowerCase();
+                        if (keyStr.includes('screen size')) {
+                            product.screen_size = spec.value;
+                        } else if (keyStr.includes('weight capacity')) {
+                            product.weight_capacity = spec.value;
+                        } else if (keyStr.includes('vesa')) {
+                            product.max_vesa = spec.value;
+                        }
+                    });
+                } catch (specErr) {
+                    console.error("Error fetching specs for product:", specErr);
+                }
+                
+                await sendProductDetailsMessage(from, product);
             } else {
                 // No product found based on text
                 console.log(`[Webhook] Unrecognized text/SKU: ${text}`);
                 
-                // Fetch up to 10 latest products to give the user options
-                const [allProducts] = await db.query('SELECT * FROM products ORDER BY created_at DESC LIMIT 10');
-                if (allProducts.length > 0) {
-                    await sendProductListMessage(from, allProducts);
+                const [catalogues] = await db.query(`
+                    SELECT id, title
+                    FROM catalog_catalogue
+                    WHERE active = 1
+                `);
+                
+                const orderList = [
+                    'Fixed Wall Mount Catalogue',
+                    'Tilt Wall Mount Catalogue',
+                    'Swivel Wall Mount - Single Arm Catalogue',
+                    'Swivel Wall Mount - Double Arm Catalogue',
+                    'TV Cart',
+                    'Gas Spring Desktop Mount Catalogue',
+                    'Projector Mounts Catalogue',
+                    'Tablet Mount Catalogue',
+                    'DVD / Receiver Mounts Catalogue'
+                ];
+                
+                catalogues.sort((a, b) => {
+                    let indexA = orderList.indexOf(a.title);
+                    let indexB = orderList.indexOf(b.title);
+                    if (indexA === -1) indexA = 999;
+                    if (indexB === -1) indexB = 999;
+                    return indexA - indexB;
+                });
+
+                if (catalogues.length > 0) {
+                    await sendCatalogueListMessage(from, catalogues, "Sorry for the inconvenience, this is not a correct code. In the 'View Catalog' below, there are some products—please use those codes for product enquiries.");
                 } else {
                     await sendTextMessage(from, "Sorry, we couldn't find any products matching that search.");
                 }
